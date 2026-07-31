@@ -47,7 +47,7 @@ services:
       - key: DB_POSTGRESDB_HOST
         sync: false
       - key: DB_POSTGRESDB_PORT
-        value: "5432"
+        sync: false
       - key: DB_POSTGRESDB_DATABASE
         sync: false
       - key: DB_POSTGRESDB_USER
@@ -99,11 +99,11 @@ services:
       - key: YOUTUBE_DATA_API_KEY
         sync: false
       - key: YOUTUBE_CATEGORY_ID
-        value: "24"
+        sync: false
 
       # ---- Workflow: content / trends ----
       - key: CONTENT_CATEGORY
-        value: Entertainment
+        sync: false
       - key: TRENDS_REGION
         value: US
 
@@ -111,9 +111,9 @@ services:
       - key: GOOGLE_SHEET_ID
         sync: false
       - key: GOOGLE_SHEET_TAB_USED_TOPICS
-        value: UsedTopics
+        sync: false
       - key: GOOGLE_SHEET_TAB_QC_LOG
-        value: QC Log
+        synce: false
 
       # ---- Notifications ----
       - key: NOTIFY_EMAIL_SUCCESS
