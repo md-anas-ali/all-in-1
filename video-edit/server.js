@@ -84,7 +84,12 @@ function makeJobDir(req, res, next) {
   fs.mkdirSync(req.jobDir, { recursive: true });
   next();
 }
-const upload = multer({ storage });
+// Generous but bounded — a single scene image/audio file or a fully
+// concatenated short is always well under this. Guards disk, not RAM
+// directly, but disk exhaustion on this box takes n8n's filesystem-mode
+// binary data down with it, which is its own path to a stuck workflow.
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_MB || '300', 10) * 1024 * 1024;
+const upload = multer({ storage, limits: { fileSize: MAX_UPLOAD_BYTES } });
 
 // ---------------------------------------------------------------------
 // Memory guard. Everything else in this file (single-job queue, disk
@@ -167,7 +172,7 @@ function runFfmpeg(args) {
     execFile(
       ffmpegPath,
       args,
-      { maxBuffer: 1024 * 1024 * 32, timeout: 5 * 60 * 1000 },
+      { maxBuffer: 1024 * 1024 * 8, timeout: 5 * 60 * 1000 },
       (err, stdout, stderr) => {
         if (err) {
           err.stderr = stderr;
@@ -421,6 +426,17 @@ app.post('/concat', memoryGuard, makeJobDir, upload.any(), (req, res) => {
       cleanup(req.jobDir);
     }
   });
+});
+
+// Must be declared last, and with 4 args, for Express to treat it as an
+// error handler. Catches multer's LIMIT_FILE_SIZE (and similar) so an
+// oversized upload gets a clean response instead of a stack trace.
+app.use((err, req, res, next) => {
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ ok: false, error: 'file_too_large', detail: `exceeds ${MAX_UPLOAD_BYTES / 1024 / 1024}MB limit` });
+  }
+  console.error('unhandled error:', err && (err.stack || err.message || err));
+  res.status(500).json({ ok: false, error: 'internal_error' });
 });
 
 app.listen(PORT, HOST, () => {
