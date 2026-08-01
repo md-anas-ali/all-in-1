@@ -45,6 +45,34 @@ app.use((req, res, next) => {
 const TMP_ROOT = path.join(os.tmpdir(), 'render-jobs');
 fs.mkdirSync(TMP_ROOT, { recursive: true });
 
+// ---------------------------------------------------------------------
+// Stale job sweep. Normally cleanup(dir) removes a job's temp files as
+// soon as it finishes, but if the process is killed mid-job (OOM, crash,
+// Render restart) that cleanup never runs and the directory is orphaned.
+// On a small container these silently eat into disk over days of 24/7
+// operation. Sweep once at boot (catches anything left from before a
+// crash) and again periodically while running (catches jobs orphaned by
+// a bug rather than a full process restart).
+// ---------------------------------------------------------------------
+const STALE_JOB_MAX_AGE_MS = 30 * 60 * 1000; // 30 min — well past any single job's lifetime
+function sweepStaleJobs() {
+  fs.readdir(TMP_ROOT, (err, entries) => {
+    if (err || !entries) return;
+    const now = Date.now();
+    for (const entry of entries) {
+      const dir = path.join(TMP_ROOT, entry);
+      fs.stat(dir, (statErr, stat) => {
+        if (statErr || !stat.isDirectory()) return;
+        if (now - stat.mtimeMs > STALE_JOB_MAX_AGE_MS) {
+          fs.rm(dir, { recursive: true, force: true }, () => {});
+        }
+      });
+    }
+  });
+}
+sweepStaleJobs(); // boot-time sweep
+setInterval(sweepStaleJobs, 10 * 60 * 1000).unref(); // safety-net sweep every 10 min
+
 const storage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, req.jobDir),
   filename: (req, file, cb) => cb(null, file.fieldname + '_' + file.originalname),
@@ -57,6 +85,68 @@ function makeJobDir(req, res, next) {
   next();
 }
 const upload = multer({ storage });
+
+// ---------------------------------------------------------------------
+// Memory guard. Everything else in this file (single-job queue, disk
+// uploads, resolution cap, stale-job sweep) reduces how much memory a
+// job uses — this is the last line of defense for when it's not
+// enough: it checks the container's actual cgroup memory usage BEFORE
+// starting a new ffmpeg job, and refuses (503) if already close to the
+// limit, instead of starting the job and risking the OS OOM-killing
+// the whole container (which takes n8n and the in-flight job down
+// with it, mid-render, with no graceful recovery).
+//
+// n8n's "Make Clip (HTTP)" / "Concat + BGM + Subtitle (HTTP)" nodes
+// already have retryOnFail + a wait-between-tries configured, so a 503
+// here just becomes a retried request a bit later, after memory from
+// the previous job has actually been freed — a real error surfaced
+// early beats a silent restart-loop.
+//
+// Fails OPEN if cgroup memory files aren't readable (e.g. a different
+// hosting platform) — this guard is a safety net on top of everything
+// else, not the only thing standing between this service and OOM.
+// ---------------------------------------------------------------------
+function readCgroupMemory() {
+  try {
+    // cgroup v2 (current Docker/Render default)
+    if (fs.existsSync('/sys/fs/cgroup/memory.max')) {
+      const maxRaw = fs.readFileSync('/sys/fs/cgroup/memory.max', 'utf8').trim();
+      if (maxRaw !== 'max') {
+        const limitBytes = parseInt(maxRaw, 10);
+        const usedBytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory.current', 'utf8').trim(), 10);
+        if (limitBytes > 0 && usedBytes >= 0) return { usedBytes, limitBytes };
+      }
+    }
+    // cgroup v1 fallback
+    if (fs.existsSync('/sys/fs/cgroup/memory/memory.limit_in_bytes')) {
+      const limitBytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory/memory.limit_in_bytes', 'utf8').trim(), 10);
+      // an unset v1 limit reads back as a huge near-2^63 number — treat that as "no limit set"
+      if (limitBytes > 0 && limitBytes < 1e15) {
+        const usedBytes = parseInt(fs.readFileSync('/sys/fs/cgroup/memory/memory.usage_in_bytes', 'utf8').trim(), 10);
+        if (usedBytes >= 0) return { usedBytes, limitBytes };
+      }
+    }
+  } catch (_) {
+    // unreadable on this platform — guard fails open below
+  }
+  return null;
+}
+
+const MEMORY_GUARD_MAX_PERCENT = parseFloat(process.env.MEMORY_GUARD_MAX_PERCENT || '88');
+function memoryGuard(req, res, next) {
+  const mem = readCgroupMemory();
+  if (!mem) return next(); // can't see cgroup memory on this host — don't block over it
+  const pct = (mem.usedBytes / mem.limitBytes) * 100;
+  if (pct >= MEMORY_GUARD_MAX_PERCENT) {
+    res.set('Retry-After', '15');
+    return res.status(503).json({
+      ok: false,
+      error: 'low_memory',
+      detail: `container memory at ${pct.toFixed(1)}% of its ${Math.round(mem.limitBytes / 1024 / 1024)}MB limit — refusing to start a new render job to avoid an OOM kill. Retry shortly.`,
+    });
+  }
+  next();
+}
 
 // ---------------------------------------------------------------------
 // Single-job-at-a-time queue. Free-tier CPU is only 0.1 vCPU — running
@@ -121,11 +211,18 @@ function getAudioDuration(filePath) {
 // ---------------------------------------------------------------------
 app.get('/health', (req, res) => {
   const mem = process.memoryUsage();
+  const cg = readCgroupMemory();
   res.json({
     ok: true,
     service: 'n8n-video-render',
     time: Date.now(),
-    memory: { rssMB: Math.round(mem.rss / 1024 / 1024), heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024) },
+    memory: {
+      rssMB: Math.round(mem.rss / 1024 / 1024),
+      heapUsedMB: Math.round(mem.heapUsed / 1024 / 1024),
+      containerUsedMB: cg ? Math.round(cg.usedBytes / 1024 / 1024) : null,
+      containerLimitMB: cg ? Math.round(cg.limitBytes / 1024 / 1024) : null,
+      containerUsedPercent: cg ? Math.round((cg.usedBytes / cg.limitBytes) * 1000) / 10 : null,
+    },
   });
 });
 
@@ -148,6 +245,7 @@ app.get('/health', (req, res) => {
 // ---------------------------------------------------------------------
 app.post(
   '/make-clip',
+  memoryGuard,
   makeJobDir,
   upload.fields([{ name: 'image', maxCount: 1 }, { name: 'audio', maxCount: 1 }]),
   (req, res) => {
@@ -169,9 +267,16 @@ app.post(
           res.status(400).json({ ok: false, error: 'could not determine duration: audio file unreadable and no valid duration field was sent' });
           return;
         }
-        const width = parseInt(req.body.width || '720', 10);
-        const height = parseInt(req.body.height || '1280', 10);
-        const fps = parseInt(req.body.fps || '24', 10);
+        // Hard cap, independent of whatever width/height the caller sends.
+        // Defaults match the workflow's own 720x1280 request, but this is
+        // what actually prevents a RAM spike if a node gets edited later
+        // (or a bug sends 1920x1080) — the cap is enforced here, not just
+        // requested there.
+        const MAX_WIDTH = parseInt(process.env.VIDEO_MAX_WIDTH || '720', 10);
+        const MAX_HEIGHT = parseInt(process.env.VIDEO_MAX_HEIGHT || '1280', 10);
+        const width = Math.min(parseInt(req.body.width || '720', 10), MAX_WIDTH);
+        const height = Math.min(parseInt(req.body.height || '1280', 10), MAX_HEIGHT);
+        const fps = Math.min(parseInt(req.body.fps || '24', 10), 30);
         const zoom = (req.body.zoom || 'in').toLowerCase();
         const weather = (req.body.weather || 'none').toLowerCase();
 
@@ -230,7 +335,7 @@ app.post(
 //     srt          (text, optional)  - full SRT subtitle content to burn in
 //   returns: raw video/mp4 bytes
 // ---------------------------------------------------------------------
-app.post('/concat', makeJobDir, upload.any(), (req, res) => {
+app.post('/concat', memoryGuard, makeJobDir, upload.any(), (req, res) => {
   enqueue(async () => {
     try {
       const clipFiles = (req.files || [])
